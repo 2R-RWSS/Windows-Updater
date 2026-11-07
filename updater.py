@@ -8,7 +8,7 @@ Entry point: main()  —  requires Windows and administrator privileges.
 """
 import os, sys, json, csv, ctypes, shutil, subprocess
 import threading, queue, platform, re, copy, tempfile
-import itertools, operator, concurrent.futures
+import concurrent.futures
 import math
 import datetime
 import time
@@ -34,7 +34,7 @@ except ImportError:
 
 # Use a distinct app version scheme (v-prefix) so it can't be visually
 # confused with Python version strings (e.g. "Python 3.9.7") in log output.
-VERSION = "v3.21.12"
+VERSION = "v3.21.16"
 
 _BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_BASE_DIR, "updconfig.json")
@@ -129,7 +129,14 @@ def load_config():
                 merged[key] = file_val
         elif isinstance(default_val, (int, float)):
             if not isinstance(file_val, bool) and isinstance(file_val, (int, float)):
-                merged[key] = file_val
+                bounds = _CONFIG_BOUNDS.get(key)
+                if bounds is not None and not (bounds[0] <= file_val <= bounds[1]):
+                    # Ignore only this value (also rejects NaN): one bad number
+                    # must not throw away every other saved setting.
+                    print(f"Warning: '{key}' = {file_val!r} is outside "
+                          f"{bounds[0]}..{bounds[1]} — using the default ({default_val}).")
+                else:
+                    merged[key] = file_val
         else:
             merged[key] = file_val
 
@@ -159,10 +166,10 @@ def save_config(cfg):
         with tempfile.NamedTemporaryFile(
             "w", dir=cfg_dir, delete=False, suffix=".tmp", encoding="utf-8"
         ) as f:
+            tmp_path = f.name            # set BEFORE writing: a failed write is cleaned up
             json.dump(cfg, f, indent=4)
-            tmp_path = f.name
         os.replace(tmp_path, CONFIG_FILE)
-    except (OSError, TypeError) as e:
+    except (OSError, TypeError, ValueError) as e:
         print(f"Warning: could not save config ({e}).")
         if tmp_path:
             try:
@@ -362,6 +369,26 @@ def strip_ansi(text):
         return text.strip()
     return _ANSI_RE.sub("", text).strip()
 
+def _extract_json_array(text):
+    """Return the first JSON array of objects embedded in *text*, or None.
+
+    Tolerates arbitrary text before/after the array ("[notice] ..." lines,
+    warnings, wrapper output) by attempting a real JSON decode at every '['
+    instead of slicing from the first '[' to the last ']'.
+    """
+    decoder = json.JSONDecoder()
+    pos = text.find("[")
+    while pos != -1:
+        try:
+            obj, _end = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
+            return obj
+        pos = text.find("[", pos + 1)
+    return None
+
+
 #==================== UPDATE ENGINE =====================
 _PIP_UPGRADE_TIMEOUT             = 300
 _PIP_LIST_TIMEOUT                = 60
@@ -374,6 +401,11 @@ _PSWINDOWSUPDATE_CHECK_TIMEOUT   = 30
 _PSWINDOWSUPDATE_INSTALL_TIMEOUT = 120
 _HEALTH_VER_TIMEOUT              = 10
 _PROBE_DEADLINE: int             = _HEALTH_VER_TIMEOUT + 5  # future.result() budget per probe
+# Upper bound for a whole health check.  Probes run <=10 at a time and each is
+# bounded by _HEALTH_VER_TIMEOUT, so a healthy check needs ~2 waves.  Anything
+# slower is a stuck probe (e.g. a grandchild process holding the output pipe
+# open after subprocess.run() killed its parent) and must not hang the dashboard.
+_HEALTH_OVERALL_DEADLINE: float = 2 * _HEALTH_VER_TIMEOUT + 10
 _DETECT_PIP_TIMEOUT              = 10
 # _DETECT_PYTHON_TIMEOUT was removed: python detection uses shutil.which()
 # which has no timeout — no subprocess call is made.
@@ -845,20 +877,17 @@ class UpdateEngine:
             if not raw:
                 _log("pip returned no output — pip upgrades skipped.", "warn")
                 return
-            # Locate both the opening '[' and the matching closing ']'
-            # so that any warning text pip emits after the JSON array (e.g.
-            # deprecation notices) is excluded before parsing.
-            json_start = raw.find("[")
-            json_end   = raw.rfind("]")
-            if json_start == -1 or json_end == -1 or json_end < json_start:
-                _log("pip output contained no JSON array — pip upgrades skipped.", "warn")
+            # Decode the first embedded JSON array of objects; text before or
+            # after it (notices, warnings) is ignored.
+            packages = _extract_json_array(raw)
+            if packages is None:
+                if "[" in raw:
+                    _log("pip output could not be parsed as JSON — pip upgrades skipped.", "error")
+                else:
+                    _log("pip output contained no JSON array — pip upgrades skipped.", "warn")
                 return
-            packages = json.loads(raw[json_start:json_end + 1])
         except subprocess.TimeoutExpired:
             _log("pip list timed out.", "error")
-            return
-        except json.JSONDecodeError:
-            _log("pip output could not be parsed as JSON — pip upgrades skipped.", "error")
             return
         if not packages:
             _log("All pip packages are up-to-date.")
@@ -927,12 +956,18 @@ class UpdateEngine:
                     _json_ok = True
                     _log(f"Windows Store: winget list JSON type: {type(raw).__name__}", "debug")
                     if isinstance(raw, list):
-                        packages = [p for p in raw if p.get("Available")]
-                    elif isinstance(raw, dict):
+                        packages = [p for p in raw if isinstance(p, dict) and p.get("Available")]
+                        if raw and not any(isinstance(p, dict) for p in raw):
+                            # e.g. a table row "Office [2021]" decodes as [2021]:
+                            # not a package list - use the bulk-upgrade fallback.
+                            _json_ok = False
+                    elif isinstance(raw, dict) and "Sources" in raw:
                         for source in raw.get("Sources", []):
+                            if not isinstance(source, dict):
+                                continue
                             packages.extend(
                                 p for p in source.get("Packages", [])
-                                if p.get("Available")
+                                if isinstance(p, dict) and p.get("Available")
                             )
                     else:
                         _log(
@@ -1372,7 +1407,8 @@ class UpdateEngine:
                 pool.submit(self._probe_one, name, info): name
                 for name, info in self.components.items()
             }
-            for future in concurrent.futures.as_completed(futures):
+            for future in concurrent.futures.as_completed(
+                    futures, timeout=_HEALTH_OVERALL_DEADLINE):
                 if self._health_stop_event.is_set():
                     # Cancel unstarted futures then shut the pool down without
                     # waiting — running threads finish in the background.
@@ -1388,6 +1424,16 @@ class UpdateEngine:
                 dashboard[name] = result
                 if _gq:
                     _gq.put(("health_row", (name, result)))
+        except concurrent.futures.TimeoutError:
+            # Some probes never returned: say so instead of hanging the UI.
+            # (Threads still running finish in the background.)
+            for name in futures.values():
+                if name not in dashboard:
+                    logger.warning(f"health_check: probe for '{name}' did not "
+                                   f"finish within {_HEALTH_OVERALL_DEADLINE}s")
+                    dashboard[name] = _PROBE_RESULT_HC_TIMEOUT
+                    if _gq:
+                        _gq.put(("health_row", (name, _PROBE_RESULT_HC_TIMEOUT)))
         finally:
             # cancel_futures=True (Py 3.9+) drops queued-but-not-started work.
             try:
@@ -1542,6 +1588,7 @@ class UpdateEngine:
             self._run_active  = True
             self._error_count = 0
         self._rebooting = False
+        self._last_failed = []          # rebuilt as components fail (see inner loop)
         _t0 = time.monotonic()
         try:
             self._run_selected_inner(selected, _t0=_t0)
@@ -1553,6 +1600,14 @@ class UpdateEngine:
         finally:
             with self._error_lock:
                 self._run_active = False
+            # Refresh the reboot-pending flag HERE (engine thread, after any run)
+            # so the GUI thread can read the cached value without touching the
+            # registry.  It was previously refreshed only by update_windows(), so
+            # a reboot left by winget / Store upgrades never showed the banner.
+            try:
+                self.is_reboot_pending()
+            except Exception:
+                logger.exception("is_reboot_pending failed")
 
     def _run_selected_inner(self, selected, _t0: float):
         """Inner update loop — iterates selected components and emits GUI progress."""
@@ -1574,7 +1629,6 @@ class UpdateEngine:
 
         _log(f"Starting updates for {total} component(s).")
         failures = 0
-        _comp_states: dict = {}   # comp_name → "done" | "error"
         with self.config_lock:
             inter_delay = self.config["delay_between_components"]
         for idx, comp in enumerate(selected):
@@ -1602,9 +1656,9 @@ class UpdateEngine:
                 had_error = self._error_count > errors_before
                 if had_error:
                     failures += 1
+                    self._last_failed.append(comp)
             # Combine comp_status + progress into a single queue message
             # to halve GUI queue traffic (1 put/get instead of 2 per component).
-            _comp_states[comp] = "error" if had_error else "done"
             if _gq:
                 _gq.put(("comp_progress", (
                     comp,
@@ -1619,11 +1673,22 @@ class UpdateEngine:
             if _gq: _gq.put(("status", "Cancelled"))
             return
 
-        do_restart = False
         with self.config_lock:
             auto_restart = self.config["auto_restart"]
             _rct         = self.config.get("restart_confirm_timeout", 30)
             dry_run      = self.config.get("dry_run", False)
+        # Record the run now - before any reboot prompt - so a run that ends in a
+        # restart still appears in History, and the time spent waiting for the
+        # prompt is not counted as update time.
+        _elapsed_s = time.monotonic() - _t0
+        self._append_run_history(
+            selected=selected,
+            failures=failures,
+            elapsed_s=_elapsed_s,
+            dry_run=dry_run,
+        )
+
+        do_restart = False
         if auto_restart:
             _log("Auto-restart enabled. Requesting confirmation before reboot…")
             if _gq:
@@ -1659,11 +1724,13 @@ class UpdateEngine:
                                check=False, capture_output=True,
                                encoding="utf-8", errors="replace",
                                **_NO_WINDOW)
-            if _gq: _gq.put(("status", "Restarting..." if not dry_run else "Dry-run: reboot skipped"))
-            return
+            if not dry_run:
+                if _gq: _gq.put(("status", "Restarting..."))
+                return
+            # Dry run: nothing was restarted - carry on to the normal completion
+            # path so the Completed status and the dry-run summary still appear.
 
         if _gq: _gq.put(("status", "Completed" if failures == 0 else f"Completed with {failures} error(s)"))
-        _elapsed_s   = time.monotonic() - _t0
         _elapsed_fmt = (f"{int(_elapsed_s // 60)} m {int(_elapsed_s % 60):02d} s"
                         if _elapsed_s >= 60 else f"{int(_elapsed_s)} s")
         if failures:
@@ -1671,17 +1738,8 @@ class UpdateEngine:
                  f"in {_elapsed_fmt}.  Check the log for details.", "warn")
         else:
             _log(f"All updates completed successfully in {_elapsed_fmt}.")
-        # Notify the GUI so it can show a completion dialog if the
-        # user has notify_on_complete enabled in settings.
-        # Store per-component failure list so the GUI can offer Retry Failed.
-        self._last_failed = [comp for comp, state in _comp_states.items()
-                             if state == "error"]
-        self._append_run_history(
-            selected=selected,
-            failures=failures,
-            elapsed_s=time.monotonic() - _t0,
-            dry_run=dry_run,   # already captured under config_lock above
-        )
+        # Notify the GUI so it can show a completion dialog if the user has
+        # notify_on_complete enabled (self._last_failed feeds "Retry Failed").
         if _gq:
             _gq.put(("run_complete", failures))
 
@@ -1990,11 +2048,40 @@ _MSGBOX_ERROR_HDR: str = "#c42b1c"   # 5.7:1 vs white
 # a run-completion or health-check status that arrived during the 2-s window).
 _COPY_LOG_SENTINEL: str = "Log copied to clipboard."
 
-# Shared itemgetter for log_batch groupby key — avoids allocating a new
-# lambda object on every call (C-level callable, faster than a Python lambda,
-# created once at import time).  Note: log_batch is no longer sorted before
-# groupby (sort was removed in v3.10.44 to preserve chronological order).
-_LOG_BATCH_KEY = operator.itemgetter(1)
+
+# Windows GetSystemMetrics indexes for the bounding box of ALL monitors.
+_SM_XVIRTUALSCREEN, _SM_YVIRTUALSCREEN = 76, 77
+_SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 78, 79
+
+
+def _virtual_desktop(widget):
+    """Return (left, top, right, bottom) of the whole multi-monitor desktop.
+
+    winfo_screenwidth()/height() describe only the PRIMARY monitor, so clamping
+    window positions to them drags windows from a secondary monitor back onto
+    the primary one and rejects saved positions with negative coordinates
+    (monitors left of / above the primary).  Falls back to Tk's virtual-root
+    metrics and then to the primary screen, so the worst case is the old behaviour.
+    """
+    if platform.system() == "Windows":
+        try:
+            gm = ctypes.windll.user32.GetSystemMetrics
+            w, h = gm(_SM_CXVIRTUALSCREEN), gm(_SM_CYVIRTUALSCREEN)
+            if w > 0 and h > 0:
+                left, top = gm(_SM_XVIRTUALSCREEN), gm(_SM_YVIRTUALSCREEN)
+                return left, top, left + w, top + h
+        except Exception:
+            pass
+    try:
+        sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+        w, h = widget.winfo_vrootwidth(), widget.winfo_vrootheight()
+        if w >= sw and h >= sh:
+            left, top = widget.winfo_vrootx(), widget.winfo_vrooty()
+            return left, top, left + w, top + h
+        return 0, 0, sw, sh
+    except (tk.TclError, TypeError, ValueError):
+        return 0, 0, 1024, 768          # placement must never be why a window fails to open
+
 
 # ── Tooltip helper ────────────────────────────────────────────────────────────
 class _ToolTip:
@@ -2053,8 +2140,7 @@ class _ToolTip:
             wy = self._w.winfo_rooty()
             ww = self._w.winfo_width()
             wh = self._w.winfo_height()
-            sx = self._w.winfo_screenwidth()
-            sy = self._w.winfo_screenheight()
+            dl, dt, dr, db = _virtual_desktop(self._w)
             tip = tk.Toplevel(self._w)
             tip.wm_overrideredirect(True)
             tip.configure(bg=brd)
@@ -2065,12 +2151,13 @@ class _ToolTip:
             tip.update_idletasks()
             tw = tip.winfo_reqwidth()
             th = tip.winfo_reqheight()
-            # Centre below the widget; clamp so the tip never leaves the screen.
+            # Centre below the widget; clamp so the tip never leaves the desktop
+            # (which may span several monitors).
             x = wx + ww // 2 - tw // 2
             y = wy + wh + 5
-            if x + tw > sx: x = sx - tw - 4
-            if x < 0:       x = 4
-            if y + th > sy: y = wy - th - 5   # flip above when near taskbar
+            if x + tw > dr: x = dr - tw - 4
+            if x < dl:      x = dl + 4
+            if y + th > db: y = wy - th - 5   # flip above when near taskbar
             tip.wm_geometry(f"+{x}+{y}")
             self._win = tip
         except Exception:
@@ -2154,6 +2241,8 @@ class UpdaterGUI:
         # Initialised here so all access sites use plain self._tray_icon
         # instead of the slower getattr(self, "_tray_icon", None).
         self._tray_icon = None
+        # Dialogs held back while the window is hidden in the tray (_show_or_defer).
+        self._deferred_dialogs: list = []
         # Dialog-open flags — prevent stacking the same dialog twice via
         # rapid key presses (Ctrl+H, Ctrl+S, F1) while wait_window is active.
         self._history_open:   bool = False
@@ -2182,6 +2271,8 @@ class UpdaterGUI:
         self._search_entry     = None
         self._search_ph_active = [False]  # mutable cell for placeholder state
         self._search_hl_active: bool = False  # True while search_hl tags exist
+        # (term, hits, capped) the current highlights are valid for; None = unknown.
+        self._search_state = None
         self._search_count_var = None  # match count StringVar
         self._search_count_lbl = None  # match count Label
         # Bottom version bar and label.
@@ -2282,8 +2373,13 @@ class UpdaterGUI:
         """
         if self._running and _TRAY_AVAILABLE:
             self.root.withdraw()
-            self._setup_tray()
-            return
+            try:
+                self._setup_tray()
+            except Exception:
+                logger.exception("could not create the tray icon")
+                self.root.deiconify()      # never leave the app invisible;
+            else:                          # fall through to the normal confirmation
+                return
         if self._running or self._health_running:
             if self._running:
                 _msg = "An update run is in progress.\n\nCancel it and close?"
@@ -2377,6 +2473,30 @@ class UpdaterGUI:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        # Dialogs held back while the window was hidden can be shown now.
+        if self._deferred_dialogs:
+            self.root.after(100, self._flush_deferred_dialogs)
+
+    def _show_or_defer(self, fn, withdrawn):
+        """Run fn() now, or hold it until the window is back on screen.
+
+        A modal dialog on a window hidden in the tray would be invisible (Tk
+        transients inherit their master's withdrawn state) yet still block the
+        poll loop - so it is queued and shown by _restore_from_tray instead.
+        """
+        if withdrawn:
+            self._deferred_dialogs.append(fn)
+        else:
+            fn()
+
+    def _flush_deferred_dialogs(self):
+        """Show the dialogs that were held back while the window was hidden."""
+        pending, self._deferred_dialogs = self._deferred_dialogs, []
+        for fn in pending:
+            try:
+                fn()
+            except Exception:
+                logger.exception("deferred dialog failed")
 
     def _remove_tray(self):
         """Stop the tray icon if active."""
@@ -2423,16 +2543,19 @@ class UpdaterGUI:
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2)
 
-        # Restore saved geometry if the window fits on the current screen.
+        # Restore saved geometry if it still fits on the current DESKTOP: any
+        # monitor is fine, including negative coordinates (monitors left of / above
+        # the primary).  A saved spot on an unplugged monitor no longer fits.
         _cfg     = self.engine.config
         _saved_w = _cfg.get("window_w", -1)
         _saved_h = _cfg.get("window_h", -1)
         _saved_x = _cfg.get("window_x", -1)
         _saved_y = _cfg.get("window_y", -1)
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)
         if (_saved_w > 0 and _saved_h > 0
-                and _saved_x >= 0 and _saved_y >= 0
-                and _saved_x + _saved_w <= sw + 50   # allow slight off-edge
-                and _saved_y + _saved_h <= sh + 50):
+                and _saved_x >= _dl - 50 and _saved_y >= _dt - 50   # allow slight off-edge
+                and _saved_x + _saved_w <= _dr + 50
+                and _saved_y + _saved_h <= _db + 50):
             w, h, x, y = _saved_w, _saved_h, _saved_x, _saved_y
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.minsize(int(900 * self._scale), int(640 * self._scale))
@@ -2613,8 +2736,9 @@ class UpdaterGUI:
                     )
                 if self._search_clr_btn is not None:
                     self._search_clr_btn.configure(
-                        bg=_widget_bg,
+                        bg=_widget_bg, fg=t["btn_fg"],
                         activebackground=_btn_hover,
+                        activeforeground=_t_fg,
                     )
                 if self._search_icon_lbl is not None:
                     self._search_icon_lbl.configure(bg=_widget_bg)
@@ -2655,7 +2779,8 @@ class UpdaterGUI:
         else:
             self.start_btn.configure(
                 bg=_accent, fg=_accent_fg,
-                activebackground=_accent, activeforeground=_accent_fg)
+                activebackground=_accent, activeforeground=_accent_fg,
+                disabledforeground=_tag_debug)
 
         # Pre-bind the two most-accessed theme values for the correction loops.
         # _section_bg appears 9×, _t_fg appears 9× below — binding them
@@ -3039,7 +3164,10 @@ class UpdaterGUI:
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
         """Format a duration in seconds as a human-readable string."""
-        secs = int(seconds)
+        try:
+            secs = int(seconds)
+        except (TypeError, ValueError):
+            return "—"   # malformed history record: show a dash, never crash
         if secs < 60:
             return f"{secs} s"
         mins, secs = divmod(secs, 60)
@@ -4113,6 +4241,13 @@ class UpdaterGUI:
     def _handle_confirm_restart(self, value):
         """Show the reboot confirmation dialog and signal the engine thread."""
         confirm_event, result_box = value
+        # The prompt is time-limited and needs an answer: never raise it on a
+        # window that is hidden in the tray.
+        try:
+            if self.root.wm_state() == "withdrawn":
+                self._restore_from_tray()
+        except tk.TclError:
+            pass
         answer = self._msgbox("yesno", "Auto-Restart",
             "All updates are complete.\n\nAuto-restart is enabled. Reboot now?\n\n"
             "(The system will restart in 10 seconds if you click Yes.)")
@@ -4124,18 +4259,15 @@ class UpdaterGUI:
         # Bind module-level constants to locals once per tick.
         # LOAD_FAST (~2× faster than LOAD_GLOBAL) benefits both the
         # drain section and the hot while-loop below.
-        _level_order  = _LOG_LEVEL_ORDER
         _dot_colour   = _DOT_COLOUR_KEY      # state→theme-key map for status dots
         _theme        = self._theme           # property: evaluated once per tick
         _max_msgs     = _MAX_MSGS_PER_TICK
         _status_syms  = _COMP_STATUS_SYMBOLS
-        _batch_key    = _LOG_BATCH_KEY
         _get          = self.queue.get_nowait  # LOAD_FAST vs 2× LOAD_ATTR in hot loop
         _put          = self.queue.put         # same binding pattern as _get
         _csl          = self._comp_status_labels  # same dict; populated once by _on_components_ready
         _lw           = self.log_widget           # 6 accesses in flush path
         _tk_end       = "end"                     # tk.END constant; avoids 2 LOAD_ATTRs per insert
-        _groupby      = itertools.groupby         # 1 LOAD_GLOBAL+LOAD_ATTR per flush
         _max_log      = _MAX_LOG_LINES            # 3 LOAD_GLOBALs per flush
         _fmt_elapsed  = self._fmt_elapsed         # used once in _unlock handler
         _llc          = self._log_line_count      # 4 accesses in flush path
@@ -4163,6 +4295,20 @@ class UpdaterGUI:
         _prog_segs       = self._prog_seg_states            # 2 accesses in comp_*
         _delay = 150  # default; overwritten inside try if work was done this tick
         try:
+            # Is the window hidden in the tray?  Computed ONCE per tick, BEFORE the
+            # message loop: it holds back modal dialogs, skips redraws and picks
+            # the poll delay.
+            try:
+                _withdrawn = self.root.wm_state() == "withdrawn"
+            except tk.TclError:
+                _withdrawn = False
+
+            # Dialogs raised by this tick's messages (completion, errors) are shown
+            # only AFTER the tick's log lines have been flushed to the widget: the
+            # dry-run summary is built from that text, and a dialog should not
+            # appear before the lines that explain it.
+            _post_flush = []
+
             # Priority pass: drain queue to find confirm_restart before other messages.
             if _engine._confirm_restart_pending.is_set():
                 # Drain the entire queue so confirm_restart is always found.
@@ -4198,9 +4344,6 @@ class UpdaterGUI:
             # Track whether any queue work was done this tick.
             # Used to choose adaptive poll delay (50ms busy / 150ms idle).
             _had_work = False
-            # _cur_min_level is cached on self and refreshed by the level-panel
-            # pick callback — no per-tick Tcl round-trip needed.
-            _cur_min_level = self._cur_min_level
             # Count only log messages toward the per-tick cap so that
             # non-log messages (progress, status, health_row, comp_status, etc.)
             # are never starved by a flood of debug output.
@@ -4224,16 +4367,16 @@ class UpdaterGUI:
                             level = "debug"; msg = msg[8:]
                         else:
                             level = "info"
-                        if _level_order[level] >= _cur_min_level:
-                            if log_count >= _max_msgs:
-                                # Only accepted messages count toward cap —
-                                # filtered-out messages must not consume budget
-                                # or starve higher-priority messages behind them.
-                                _put((action, value))
-                                break
-                            log_count += 1
-                            log_batch.append((msg, level))
-                            _had_work = True
+                        # Every line is kept; the level filter only ELIDES lines
+                        # (see _apply_log_filter).  Dropping them here made the
+                        # filter irreversible and starved the dry-run summary,
+                        # which is built from the widget text.
+                        if log_count >= _max_msgs:
+                            _put((action, value))
+                            break
+                        log_count += 1
+                        log_batch.append((msg, level))
+                        _had_work = True
                     elif action == "log_header":
                         _had_work = True
                         if log_count < _max_msgs:
@@ -4279,7 +4422,7 @@ class UpdaterGUI:
                         break   # stop draining; next tick's priority pass handles it
                     elif action == "error":
                         _had_work = True
-                        _msgbox("error", "Error", value)
+                        _post_flush.append(lambda v=value: _msgbox("error", "Error", v))
                     elif action == "_unlock":
                         _had_work = True
                         self._running = False
@@ -4329,7 +4472,7 @@ class UpdaterGUI:
                         _tray = self._tray_icon
                         if _tray and _TRAY_AVAILABLE:
                             try:
-                                _tray.notify("Updates complete", f"Windows Updater {VERSION}")
+                                _tray.notify(_status_var.get(), f"Windows Updater {VERSION}")
                             except Exception:
                                 pass
                             _root_after(1500, _restore_tray)
@@ -4358,51 +4501,65 @@ class UpdaterGUI:
                     elif action == "run_complete":
                         _had_work = True
                         failures = value
-                        # Show dry-run summary when dry_run is active.
+                        # Dry-run summary, or the completion dialog when
+                        # notify_on_complete is on - queued, and shown after the
+                        # flush below (held back while hidden in the tray).
                         if _dry_run_var.get():
-                            _show_dry_run()
-                        # Show completion dialog if notify_on_complete is enabled.
+                            _post_flush.append(_show_dry_run)
                         elif _engine._notify_on_complete:
                             if failures:
-                                _msgbox("warn", "Updates Complete",
-                                    f"Updates finished with {failures} error(s).\nCheck the log for details.")
+                                _post_flush.append(lambda n=failures: _msgbox(
+                                    "warn", "Updates Complete",
+                                    f"Updates finished with {n} error(s).\n"
+                                    "Check the log for details."))
                             else:
-                                _msgbox("info", "Updates Complete", "All updates completed successfully.")
+                                _post_flush.append(lambda: _msgbox(
+                                    "info", "Updates Complete",
+                                    "All updates completed successfully."))
                 except queue.Empty:
                     break
 
             if log_batch:
                 _lw_cfg(state="normal")
-                # One timestamp per flush (seconds granularity is enough).
-                _ts = datetime.datetime.now().strftime("%H:%M:%S ")
-                # groupby on the *unsorted* batch — preserves chronological order.
+                # One timestamp per flush (seconds granularity is enough): the first
+                # entry gets it, later entries an equal-width pad so columns align.
+                _ts  = datetime.datetime.now().strftime("%H:%M:%S ")
+                _pad = " " * len(_ts)
+                # Build ONE flat (text, tag, text, tag, ...) argument list and insert
+                # the whole batch with a single Tk call - Text.insert accepts any
+                # number of chars/tagList pairs - instead of two calls per line.
+                _parts = []
                 _first_in_flush = True
-                for tag, group in _groupby(log_batch, key=_batch_key):
-                    lines_in_group = [m for m, _ in group]
-                    for i, msg in enumerate(lines_in_group):
-                        if tag == "header":
-                            # Headers get a blank separator line then the header.
-                            _lw_insert(_tk_end, "\n", "info")
-                            _lw_insert(_tk_end, msg + "\n", "header")
-                        else:
-                            # Timestamp prefix on the first line of each flush,
-                            # then indent-aligned spaces for subsequent lines.
-                            if _first_in_flush and i == 0:
-                                _lw_insert(_tk_end, _ts, "ts")
-                            else:
-                                _lw_insert(_tk_end, " " * len(_ts), "ts")
-                            _lw_insert(_tk_end, msg + "\n", tag)
-                        _first_in_flush = False
-                _llc += len(log_batch)
+                for msg, tag in log_batch:
+                    if tag == "header":
+                        # Headers get a blank separator line, then the header.
+                        _parts += ("\n", "info", msg + "\n", "header")
+                    else:
+                        _parts += (_ts if _first_in_flush else _pad, "ts", msg + "\n", tag)
+                    _first_in_flush = False
+                # With a search term active, remember where the new text begins so the
+                # search can be extended over just that text instead of the whole log.
+                _search_on = _lsv is not None and bool(_lsv.get())
+                _scan_from = _lw.index("end-1c") if _search_on else None
+                _trimmed = False
+                _lw_insert(_tk_end, *_parts)
+                # A header entry occupies TWO widget lines (blank + header); count
+                # lines, not entries, or the trim below keeps too many.
+                _llc += len(log_batch) + sum(1 for _m, _t in log_batch if _t == "header")
                 if _llc > _max_log:
+                    _trimmed = True          # old lines are deleted: highlights shift
                     excess = _llc - _max_log
                     _lw.delete("1.0", f"{excess + 1}.0")
                     _llc = _max_log
                 self._log_line_count = _llc  # write-back: persist trim result
-                # Re-run search after insert AND after trim — trimmed lines
-                # may have had highlights, leaving the count label stale.
-                if _lsv is not None and _lsv.get():
-                    _search_fn()
+                # Keep the search highlights current: a full scan only when lines were
+                # trimmed (highlights shifted / vanished), otherwise just the newly
+                # inserted text.  Never move the view.
+                if _search_on:
+                    if _trimmed:
+                        _search_fn(scroll=False)
+                    else:
+                        self._extend_log_search(_scan_from)
                 # Auto-scroll only when the view is already at the bottom.
                 # If the user has scrolled up to review earlier output,
                 # do not forcibly jump back down on every flush.
@@ -4410,18 +4567,15 @@ class UpdaterGUI:
                     _lw_see(_tk_end)
                 _lw_cfg(state="disabled")
 
-            # Compute wm_state ONCE per tick — used for both:
-            #   (a) skipping _redraw when minimised to tray
-            #   (b) choosing the adaptive poll delay
-            # MUST be assigned before the `if not _withdrawn` guard below.
-            try:
-                _withdrawn = self.root.wm_state() == "withdrawn"
-            except tk.TclError:
-                _withdrawn = False
-
-            # Redraw progress once per tick; skip when minimised to tray.
+            # Redraw progress once per tick; skip when minimised to tray
+            # (_withdrawn was computed at the top of the tick).
             if not _withdrawn:
                 _redraw()
+
+            # Now that this tick's log lines are in the widget and the status /
+            # buttons are up to date, show the dialogs its messages asked for.
+            for _fn in _post_flush:
+                self._show_or_defer(_fn, _withdrawn)
 
             # Adaptive poll delay:
             #   50 ms  — work done this tick (messages flowing)
@@ -4460,6 +4614,7 @@ class UpdaterGUI:
         except Exception:
             pass
         self._search_hl_active = False
+        self._search_state = None
         if self._search_count_var is not None:
             self._search_count_var.set("")
         _cfg(state="disabled")
@@ -4673,13 +4828,14 @@ class UpdaterGUI:
         panel.update_idletasks()
         pw = panel.winfo_reqwidth()
         ph = panel.winfo_reqheight()
-        sx = self.root.winfo_screenwidth()
-        sy = self.root.winfo_screenheight()
+        dl, dt, dr, db = _virtual_desktop(self.root)
         px = self.root.winfo_pointerx()
         py = self.root.winfo_pointery() + 4   # small gap below cursor
-        if px + pw > sx:
-            px = sx - pw - 4
-        if py + ph > sy:
+        if px + pw > dr:
+            px = dr - pw - 4
+        if px < dl:
+            px = dl + 4
+        if py + ph > db:
             py = py - ph - 8    # flip above cursor if no room below
         panel.geometry(f"+{px}+{py}")
 
@@ -4773,10 +4929,10 @@ class UpdaterGUI:
         _ww, _wh = win.winfo_reqwidth(),  win.winfo_reqheight()
         _pw, _ph = self.root.winfo_width(), self.root.winfo_height()
         _px, _py = self.root.winfo_rootx(), self.root.winfo_rooty()
-        _sx, _sy = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)   # whole desktop, all monitors
         win.geometry(
-            f"+{max(4, min(_px + (_pw - _ww) // 2, _sx - _ww - 4))}"
-            f"+{max(4, min(_py + (_ph - _wh) // 2, _sy - _wh - 4))}")
+            f"+{max(_dl + 4, min(_px + (_pw - _ww) // 2, _dr - _ww - 4))}"
+            f"+{max(_dt + 4, min(_py + (_ph - _wh) // 2, _db - _wh - 4))}")
         win.bind("<Escape>", _close)
         win.bind("<Destroy>",
                  lambda _e: setattr(self, "_shortcuts_open", False)
@@ -4939,10 +5095,10 @@ class UpdaterGUI:
         _ww, _wh = win.winfo_reqwidth(), win.winfo_reqheight()
         _pw, _ph = self.root.winfo_width(),  self.root.winfo_height()
         _px, _py = self.root.winfo_rootx(),  self.root.winfo_rooty()
-        _sx, _sy = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)   # whole desktop, all monitors
         win.geometry(
-            f"+{max(4, min(_px + (_pw - _ww) // 2, _sx - _ww - 4))}"
-            f"+{max(4, min(_py + (_ph - _wh) // 2, _sy - _wh - 4))}")
+            f"+{max(_dl + 4, min(_px + (_pw - _ww) // 2, _dr - _ww - 4))}"
+            f"+{max(_dt + 4, min(_py + (_ph - _wh) // 2, _db - _wh - 4))}")
         # Arrow key navigation: Up/Down cycle through the level rows.
         _level_keys = [k for k, _ in _levels]
         def _nav(direction, _e=None):
@@ -4989,7 +5145,7 @@ class UpdaterGUI:
         # Elided lines still have search_hl tags but are invisible — the
         # count label would otherwise show stale numbers after filter changes.
         if self._log_search_var is not None and self._log_search_var.get():
-            self._on_log_search()
+            self._on_log_search(scroll=False)
 
     def open_settings(self):
         """Settings panel — overrideredirect, scrollable canvas body.
@@ -5261,21 +5417,24 @@ class UpdaterGUI:
                     snap = copy.deepcopy(self.engine.config)
                 save_config(snap)
                 _current_presets[nm] = sv; _lb_refresh(); _d_close()
-            br = tk.Frame(b2, bg=_sbg)
-            br.grid(row=1, column=0, columnspan=2, pady=(8, 0))
-            self._make_btn(br, "Save", _commit, accent=True).pack(
-                side="left", padx=(0, 6))
-            self._make_btn(br, "Cancel", _d_close).pack(side="left")
+            # Footer: 1-px rule + right-aligned buttons, identical to the other
+            # dialogs (Save rightmost, Cancel to its left, as in Settings).
+            tk.Frame(_d_outer, bg=_brd, height=1, bd=0).pack(fill="x")
+            _d_foot = tk.Frame(_d_outer, bg=_sbg, bd=0)
+            _d_foot.pack(fill="x", padx=20, pady=8)
+            self._make_btn(_d_foot, "Save", _commit, accent=True).pack(
+                side="right", padx=(6, 0))
+            self._make_btn(_d_foot, "Cancel", _d_close).pack(side="right")
             ent.bind("<Return>", lambda _e: _commit())
             d.bind("<Escape>", _d_close)
             d.update_idletasks()
             _dw, _dh   = d.winfo_reqwidth(),   d.winfo_reqheight()
             _wx2, _wy2 = win.winfo_rootx(),    win.winfo_rooty()
             _ww2, _wh2 = win.winfo_width(),    win.winfo_height()
-            _sx2, _sy2 = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            _dl2, _dt2, _dr2, _db2 = _virtual_desktop(self.root)
             d.geometry(
-                f"+{max(4, min(_wx2+(_ww2-_dw)//2, _sx2-_dw-4))}"
-                f"+{max(4, min(_wy2+(_wh2-_dh)//2, _sy2-_dh-4))}")
+                f"+{max(_dl2 + 4, min(_wx2+(_ww2-_dw)//2, _dr2-_dw-4))}"
+                f"+{max(_dt2 + 4, min(_wy2+(_wh2-_dh)//2, _db2-_dh-4))}")
             self._apply_titlebar_theme(d); d.deiconify()
 
         def _preset_delete():
@@ -5398,10 +5557,10 @@ class UpdaterGUI:
         _ww, _wh = win.winfo_reqwidth(), win.winfo_reqheight()
         _pw, _ph = self.root.winfo_width(),  self.root.winfo_height()
         _px, _py = self.root.winfo_rootx(),  self.root.winfo_rooty()
-        _sx, _sy = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)   # whole desktop, all monitors
         win.geometry(
-            f"+{max(4, min(_px + (_pw - _ww) // 2, _sx - _ww - 4))}"
-            f"+{max(4, min(_py + (_ph - _wh) // 2, _sy - _wh - 4))}")
+            f"+{max(_dl + 4, min(_px + (_pw - _ww) // 2, _dr - _ww - 4))}"
+            f"+{max(_dt + 4, min(_py + (_ph - _wh) // 2, _db - _wh - 4))}")
         win.bind("<Escape>", _close)
         self._apply_titlebar_theme(win)
         win.deiconify()
@@ -5517,10 +5676,10 @@ class UpdaterGUI:
         _pw, _ph = par.winfo_width(), par.winfo_height()
         _px, _py = par.winfo_rootx(), par.winfo_rooty()
         _ww, _wh = win.winfo_reqwidth(), win.winfo_reqheight()
-        _sx, _sy = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)   # whole desktop, all monitors
         win.geometry(
-            f"+{max(4, min(_px + (_pw - _ww) // 2, _sx - _ww - 4))}"
-            f"+{max(4, min(_py + (_ph - _wh) // 2, _sy - _wh - 4))}")
+            f"+{max(_dl + 4, min(_px + (_pw - _ww) // 2, _dr - _ww - 4))}"
+            f"+{max(_dt + 4, min(_py + (_ph - _wh) // 2, _db - _wh - 4))}")
         win.bind("<Escape>", lambda _e: _mb_close())
         self._apply_titlebar_theme(win)
         win.deiconify()
@@ -5555,6 +5714,7 @@ class UpdaterGUI:
                 history = []
         except (OSError, json.JSONDecodeError):
             history = []
+        history = [r for r in history if isinstance(r, dict)]
 
         t    = self._theme
         _sbg = t["widget_bg"]
@@ -5589,6 +5749,20 @@ class UpdaterGUI:
                  bg=_sec, fg=_fg,
                  font=("Segoe UI", 10, "bold"),
                  padx=10, pady=8).pack(side="left")
+
+        # Close handler, ✕ and the header rule are created HERE, directly under
+        # the header, so (a) the empty-state branch below can reference
+        # _hist_close and (b) the 1-px rule is packed beneath the header
+        # instead of after the body (where it rendered at the bottom).
+        def _hist_close(_e=None):
+            self._history_open = False
+            try:
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass  # already destroyed (rapid double-click)
+        self._make_close_x(hdr, _hist_close, _sec, _dim, _fg)
+        tk.Frame(outer, bg=_brd, height=1, bd=0).pack(fill="x")
 
         if not history:
             body = tk.Frame(outer, bg=_sbg, bd=0)
@@ -5666,9 +5840,9 @@ class UpdaterGUI:
                     pass
             tree.bind("<Control-c>", _copy_sel_row)
             for rec in reversed(history):
-                ts      = rec.get("timestamp", "?")
+                ts      = str(rec.get("timestamp", "?"))
                 comps   = ", ".join(_COMP_DISPLAY_NAMES.get(c, c)
-                                    for c in rec.get("components", []))
+                                    for c in (rec.get("components") or []))
                 failures = rec.get("failures", 0)
                 elapsed  = self._fmt_elapsed(rec.get("elapsed_s", 0))
                 mode     = "🔵 Dry Run" if rec.get("dry_run") else "✅ Live"
@@ -5702,10 +5876,10 @@ class UpdaterGUI:
                             w.writerow(["Date/Time","Components","Failures",
                                         "Duration (s)","Dry Run"])
                             for r in history:
-                                w.writerow([r.get("timestamp","").replace("T"," "),
+                                w.writerow([str(r.get("timestamp","")).replace("T"," "),
                                             ";".join(
                                 _COMP_DISPLAY_NAMES.get(c, c)
-                                for c in r.get("components", [])
+                                for c in (r.get("components") or [])
                             ),
                                             r.get("failures",0),
                                             r.get("elapsed_s",0),
@@ -5734,7 +5908,7 @@ class UpdaterGUI:
 
             self._make_btn(btn_row, "Export…", _export_hist).pack(side="left", padx=(0, 6))
             self._make_btn(btn_row, "Clear History", _clear_hist).pack(side="left")
-            self._make_btn(btn_row, "Close", win.destroy).pack(side="right")
+            self._make_btn(btn_row, "Close", _hist_close).pack(side="right")
             tk.Label(btn_row,
                      text="Click header to sort  ·  Ctrl+C copies row  ·  Esc to close",
                      bg=_sbg, fg=_dim,
@@ -5744,21 +5918,12 @@ class UpdaterGUI:
         win.update_idletasks()
         _pw, _ph = self.root.winfo_width(),   self.root.winfo_height()
         _px, _py = self.root.winfo_rootx(),   self.root.winfo_rooty()
-        _sx, _sy = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _dl, _dt, _dr, _db = _virtual_desktop(self.root)   # whole desktop, all monitors
         _ww = max(720, int(_pw * 0.82))
         _wh = max(440, int(_ph * 0.75))
-        _wx = max(4, min(_px + (_pw - _ww) // 2, _sx - _ww - 4))
-        _wy = max(4, min(_py + (_ph - _wh) // 2, _sy - _wh - 4))
+        _wx = max(_dl + 4, min(_px + (_pw - _ww) // 2, _dr - _ww - 4))
+        _wy = max(_dt + 4, min(_py + (_ph - _wh) // 2, _db - _wh - 4))
         win.geometry(f"{_ww}x{_wh}+{_wx}+{_wy}")
-        def _hist_close(_e=None):
-            self._history_open = False
-            try:
-                win.grab_release()
-                win.destroy()
-            except tk.TclError:
-                pass  # already destroyed (rapid double-click)
-        self._make_close_x(hdr, _hist_close, _sec, _dim, _fg)
-        tk.Frame(outer, bg=_brd, height=1, bd=0).pack(fill="x")
         win.bind("<Escape>", lambda _e: _hist_close())
         # WM_DELETE_WINDOW not applicable with overrideredirect=True
         self._apply_titlebar_theme(win)
@@ -5838,8 +6003,12 @@ class UpdaterGUI:
         self._msgbox("info", "Dry-Run Summary", summary)
 
     # ── Log Search ────────────────────────────────────────────────────────────
-    def _on_log_search(self, *_):
-        """Highlight / filter log lines matching the search term."""
+    def _on_log_search(self, *_, scroll=True):
+        """Highlight every match of the search term (a full scan of the log).
+
+        scroll=True (the user typed) jumps to the first match.  Log updates and
+        filter changes pass scroll=False so they never move the view.
+        """
         if self._log_search_var is None:
             return
         # Guard: not yet initialised.
@@ -5850,44 +6019,71 @@ class UpdaterGUI:
             return  # placeholder visible, nothing real to search
         term = self._log_search_var.get().lower()
         lw = self.log_widget
+        # Clear previous highlights only when highlights are known to exist (skips
+        # a Tcl round-trip on the first keystrokes, before any match).
         if self._search_hl_active and self._log_line_count > 0:
             lw.tag_remove("search_hl", "1.0", "end")
             self._search_hl_active = False
+        self._search_state = None
         if not term:
             if self._search_count_var is not None:
                 self._search_count_var.set("")
             return
-        # Highlight all matching lines (tag colours configured in _apply_theme).
-        # Bind hot-path methods and term length once — saves LOAD_ATTR + len()
-        # per match when the log contains many hits (e.g. searching "warn").
-        _lw_search  = lw.search
-        _lw_tag_add = lw.tag_add
-        _term_len   = len(term)
-        _first  = None
-        _n_hits = 0
-        _capped = False
-        idx = "1.0"
-        while _n_hits < _MAX_SEARCH_MATCHES:
+        _first, _n_hits, _capped = self._scan_search(term, "1.0", 0)
+        self._search_state = (term, _n_hits, _capped)
+        self._show_search_count(_n_hits, _capped)
+        if scroll and _first:
+            lw.see(_first)
+
+    def _scan_search(self, term, idx, n_hits):
+        """Tag matches of *term* from index *idx* on, up to the match cap.
+
+        Returns (first_match_index_or_None, total_hits, capped).
+        """
+        lw = self.log_widget
+        _lw_search, _lw_tag_add = lw.search, lw.tag_add
+        _term_len, _first, _capped = len(term), None, False
+        while n_hits < _MAX_SEARCH_MATCHES:
             idx = _lw_search(term, idx, nocase=True, stopindex="end")
             if not idx:
                 break
             if _first is None:
-                _first = idx            # capture first match
-                self._search_hl_active = True  # set once; not every iteration
+                _first = idx
+                self._search_hl_active = True   # set once, on the first match
             end_idx = f"{idx}+{_term_len}c"
             _lw_tag_add("search_hl", idx, end_idx)
             idx = end_idx
-            _n_hits += 1
+            n_hits += 1
         else:
-            _capped = True   # hit the cap before all matches found
+            _capped = True                      # cap reached: more matches may exist
+        return _first, n_hits, _capped
+
+    def _show_search_count(self, n_hits, capped):
+        """Update the match-count label ("3 matches", "1 match", "500+ (limit) matches")."""
         if self._search_count_var is not None:
-            # Use _n_hits counter from the loop — avoids lw.tag_ranges() Tcl call.
-            _s = "matches" if _n_hits != 1 else "match"
-            _cap_sfx = "+ (limit)" if _capped else ""
-            self._search_count_var.set(
-                f"{_n_hits}{_cap_sfx} {_s}" if _n_hits else "")
-        if _first:
-            lw.see(_first)
+            _s = "matches" if n_hits != 1 else "match"
+            _cap_sfx = "+ (limit)" if capped else ""
+            self._search_count_var.set(f"{n_hits}{_cap_sfx} {_s}" if n_hits else "")
+
+    def _extend_log_search(self, from_idx):
+        """Add matches found in text appended since *from_idx* - without re-scanning.
+
+        Exact because every log line ends with a newline and a search term cannot
+        contain one, so no match can straddle the old/new boundary.  Once the cap
+        is reached the first N matches can no longer change, so nothing is done.
+        Falls back to a full scan whenever the highlights are not known to match
+        the current term.
+        """
+        st = self._search_state
+        term = self._log_search_var.get().lower() if self._log_search_var is not None else ""
+        if st is None or not term or st[0] != term or self._search_ph_active[0]:
+            return self._on_log_search(scroll=False)
+        _term, n_hits, capped = st
+        if capped:
+            return
+        _first, n_hits, capped = self._scan_search(term, from_idx, n_hits)
+        self._search_state = (term, n_hits, capped)
+        self._show_search_count(n_hits, capped)
 
     # ── Estimated Duration ────────────────────────────────────────────────────
     def _update_est_duration(self):
@@ -5902,15 +6098,24 @@ class UpdaterGUI:
                 _edv.set("")
                 return
             # Take the mean of the last 5 live (non-dry-run) runs.
-            live = [r for r in history if not r.get("dry_run") and r.get("elapsed_s", 0) > 0]
+            # Keep only usable live runs and skip anything malformed: a corrupt or
+            # hand-edited history must never abort start-up.  Each run is capped
+            # at 3600 s so one overnight outlier cannot skew the estimate.
+            live = []
+            for r in history:
+                if not isinstance(r, dict) or r.get("dry_run"):
+                    continue
+                try:
+                    secs = float(r.get("elapsed_s", 0))
+                except (TypeError, ValueError):
+                    continue
+                if secs > 0:
+                    live.append(min(secs, 3600.0))
             if not live:
                 _edv.set("")
                 return
             recent = live[-5:]
-            def _safe_e(r):
-                try: return min(float(r["elapsed_s"]), 3600.0)
-                except (TypeError, ValueError, KeyError): return 0.0
-            avg_s = sum(_safe_e(r) for r in recent) / len(recent)
+            avg_s = sum(recent) / len(recent)
             # Compact format for the toolbar: "· ~2 m" instead of the
             # full "· Est. 2 m 14 s" to keep the status row readable.
             _mins = int(avg_s // 60)
@@ -5954,15 +6159,28 @@ def _set_console_visible(visible: bool) -> None:
         pass
 
 
+def _fatal_message(text: str) -> None:
+    """Blocking error box that still works with no window and a hidden console."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, text, "Windows Updater — start-up failed", 0x10)
+    except Exception:
+        print(text)
+
+
 def main():
     """Application entry point — checks platform, attaches log handler, and starts the GUI."""
     if platform.system() != "Windows":
         print("This tool only runs on Windows.")
         sys.exit(1)
     if not logger.handlers:
-        _fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-        _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(_fh)
+        try:
+            _fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+            _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            logger.addHandler(_fh)
+        except OSError as _log_err:
+            # Read-only or missing folder: run without a log file instead of dying.
+            print(f"Warning: log file unavailable ({_log_err}); continuing without it.")
+            logger.addHandler(logging.NullHandler())
     if not is_admin():
         elevate()
     config, config_load_error = load_config()
@@ -5980,15 +6198,24 @@ def main():
                 ctypes.windll.user32.SetProcessDPIAware()    # legacy fallback
             except (AttributeError, OSError):
                 pass
-    root   = tk.Tk()
-    root.withdraw()          # Hide until fully initialised — prevents empty-window flash.
-    gui    = UpdaterGUI(root, engine)
-    if config_load_error:
-        gui.queue.put((
-            "error",
-            f"Config file could not be parsed - defaults were used.\n\nDetails: {config_load_error}"
-        ))
-    root.mainloop()
+    try:
+        root   = tk.Tk()
+        root.withdraw()          # Hide until fully initialised — prevents empty-window flash.
+        gui    = UpdaterGUI(root, engine)
+        if config_load_error:
+            gui.queue.put((
+                "error",
+                f"Config file could not be parsed - defaults were used.\n\nDetails: {config_load_error}"
+            ))
+        root.mainloop()
+    except Exception as _fatal:
+        # With debug mode off the console is hidden, so a start-up crash would vanish
+        # without a trace: bring the console back and tell the user what happened.
+        logger.exception("Fatal error during start-up")
+        _set_console_visible(True)
+        _fatal_message("Windows Updater could not start.\n\n"
+                       f"{type(_fatal).__name__}: {_fatal}\n\nDetails: {LOG_FILE}")
+        raise
 
 
 if __name__ == "__main__":

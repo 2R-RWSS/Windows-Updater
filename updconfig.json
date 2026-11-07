@@ -18,10 +18,10 @@
     "winget_source_update": true,
     "winget_include_unknown": true,
     "pip_skip_editable": false,
-    "window_w": 1790,
+    "window_w": 1611,
     "window_h": 918,
-    "window_x": 71,
-    "window_y": 30,
+    "window_x": 298,
+    "window_y": 39,
     "presets": {},
     "components": {
         "winget": true,
